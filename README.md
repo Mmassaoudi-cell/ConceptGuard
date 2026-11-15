@@ -1,85 +1,92 @@
 # ConceptGuard-RL
 
-Source code for **ConceptGuard-RL**, a concept-bottleneck reinforcement-learning policy for
-network intrusion response. The policy operates over a partially-observable five-action
-environment (classify benign, classify attack, abstain, request telemetry at a cost, escalate to
-an analyst) and routes its state through predicted, human-meaningful concepts rather than raw
-packet features, with a working intervention mechanism for analyst correction.
+ConceptGuard-RL is a reinforcement-learning policy for network intrusion response that acts through a
+concept bottleneck. In a partially observable five-action environment (classify benign, classify attack,
+abstain, request telemetry at a cost, escalate to an analyst), the policy sees a cheap, always-visible block
+of each flow. When it pays for telemetry, a concept predictor maps the revealed telemetry to eight
+human-meaningful concepts, and the policy decides from these predicted concepts only. An analyst can replace
+the predicted concepts with verified values at the same decision state, and the model reports how often this
+changes, corrects or harms the decision.
 
-This repository also includes the source code for six other candidate RL/graph architectures
-screened for the same task (CrossGuard-RL, TTA-GraphRL, TailGuard, HyperGuard-RL, RiemannGuard,
-CDE-Guard) and the baseline/statistical-testing scripts they were compared against, for full
-transparency into the selection process — not just the final method.
+The policy is trained with squared-error value regression, full-feedback targets (the reward of every
+non-telemetry action is known once the label is known), and a telemetry price calibrated by dual ascent so
+that the policy respects the per-window telemetry budget.
 
-This repository contains source code only: no datasets, figures, tables, results, or manuscript
-files are included.
+The whole model is in one file, `conceptguard_rl.py`: concept predictor, policy training with price
+calibration and validation-based checkpoint selection, window-level scoring, and intervention scores.
 
-## Repository structure
+## Install
 
-```
-project/code/
-  common/                     Shared infrastructure
-    data_utils.py               Leakage-safe loading/splitting/preprocessing
-    dataset_configs.py          Per-dataset config (paths, label columns, id-like columns)
-    device_shift_loader.py      Real benign-distribution-shift split (Edge-IIoTset)
-    graph_env.py                Shared 5-action POMDP environment + graph encoders (SAGE/GCN/GAT)
-    dqn.py                      DQN trainer
-    qr_dqn.py                   Quantile-Regression DQN (distributional RL) trainer
-    encoders.py                 Graph encoder pretraining + Tent test-time adapter
-    hypergraph.py                Typed hypergraph encoder
-    hyperbolic.py                Poincare-ball hyperbolic encoder
-    multimodal.py                Modality-block fusion encoder
-    timedecay.py                  Time-decay GRU (continuous-time-aware recurrent encoder)
-
-  candidates/
-    conceptguard_rl.py           ConceptGuard-RL (the proposed/selected method)
-    crossguard_rl.py             CrossGuard-RL (missing-modality-robust contrastive fusion)
-    tta_graphrl.py                TTA-GraphRL (test-time-adaptive graph RL)
-    tta_graphrl_deviceshift.py    TTA-GraphRL device-holdout shift experiment
-    tailguard.py                  TailGuard (distributional/CVaR risk-sensitive RL)
-    hyperguard_rl.py              HyperGuard-RL (temporal hypergraph RL)
-    riemannguard.py                RiemannGuard (hyperbolic curvature RL)
-    cdeguard.py                    CDE-Guard (time-decay graph RL)
-
-  baselines/
-    run_classical_baselines.py     Initial 4-model classical sweep
-    run_classical_baselines_v2.py  Extended 14-model classical/tree/MLP sweep
-    run_deep_baselines.py          Deep sequence baselines (1D-CNN, LSTM, GRU, Transformer)
-    run_rl_graph_baselines.py      Graph (GCN/GraphSAGE/GAT) and RL (random policy, vanilla DQN) baselines
-    statistical_tests.py            Paired Wilcoxon + Holm correction significance testing
-
-  screen_datasets.py              Dataset screening utility
-  make_figures.py                 Plotting code for result figures (not the figures themselves)
-```
-
-## Setup
+The model needs three packages: `numpy`, `torch` (PyTorch) and `scikit-learn`. It was developed and tested with Python 3.13 and PyTorch 2.12 on CPU.
 
 ```bash
-pip install -r requirements.txt
+pip install numpy torch scikit-learn
 ```
 
-Requires a local dataset collection (UNSW-NB15, Edge-IIoTset, Bot_IoT, CICIoT23, RT-IoT2022, etc.)
-laid out per the paths in `project/code/common/dataset_configs.py`.
-
-## Known limitation: hardcoded local paths
-
-This code was developed and run on a single research workstation, and several files contain
-hardcoded absolute Windows paths (dataset locations in `dataset_configs.py`; results/log output
-directories in the `candidates/` and `baselines/` scripts). **These must be edited to match your
-own environment before running.** This is a known reproducibility gap, not an oversight —
-parameterizing them via environment variables or a config file is a natural follow-up.
+Copy `conceptguard_rl.py` into your project, or clone this repository and import it from the repository root.
 
 ## Usage
 
-Each candidate script is runnable standalone, e.g.:
+The model takes numeric arrays that are already scaled and encoded. For each flow it needs the cheap block,
+the telemetry block, the standardized concept values, and the label (1 = attack, 0 = benign). The label is
+used only to form reward targets during training and is never part of an observation.
 
-```bash
-python project/code/candidates/conceptguard_rl.py --dataset unsw_nb15 --seed 42 --device cuda
+```python
+from conceptguard_rl import ConceptGuardRL, Flows, Rewards, ACTIONS
+
+train = Flows(cheap=cheap_train, telemetry=tel_train, concepts=conc_train, labels=y_train)
+val   = Flows(cheap=cheap_val,   telemetry=tel_val,   concepts=conc_val,   labels=y_val)
+test  = Flows(cheap=cheap_test,  telemetry=tel_test,  concepts=conc_test,  labels=y_test)
+
+model = ConceptGuardRL(rewards=Rewards(escalate=0.2), budget=32, window=256, seed=1)
+model.fit(train, val, episodes=300, eps_decay=150)
+
+scores = model.score(test, n_windows=50, interventions=True)
+print(scores["mean_reward_per_flow"], scores["coverage"], scores["classified_accuracy"])
+print(scores["intervention"]["concept_visible_states"])   # action-change, error-correction, harm rates
+
+print(model.telemetry_price_)                               # calibrated telemetry price (lambda)
+
+# decision for one flow of a window, before and after a telemetry request
+a = model.decide(cheap_row, budget_left=32, position=0)
+a = model.decide(cheap_row, budget_left=31, position=0, previous_action=3, telemetry=tel_row)
+print(ACTIONS[a])
 ```
 
-See each script's `argparse` block for its specific arguments (seed, episode/window counts,
-device, dataset-specific options).
+`Rewards` sets the environment rewards (true positive, false positive, true negative, false negative,
+abstain, telemetry, escalate). `score` rolls the greedy policy out on windows drawn from the given flows and
+returns the mean reward per flow, coverage, accuracy and macro-F1 on classified flows, the macro-F1 over all
+flows when escalations are resolved correctly by the analyst, and the telemetry and escalation rates.
+`model.state_dict()` and `model.load_state_dict(...)` save and restore a fitted model.
+
+## Result
+
+On UNSW-NB15 (official training and testing partitions, ten seeds), with telemetry for at most 12.5% of the
+flows in a window, the policy reaches a mean reward per flow of 0.518 when an analyst escalation is cheap
+and 0.384 when it is costly, against 0.439 and 0.160 for the same policy trained with a standard DQN recipe
+(Huber loss, chosen-action targets, no budget price). This is above a causal supervised cascade with the same telemetry budget in the cheap
+regime (0.503) and within 0.013 of it in the costly regime (0.397). In the cheap regime the policy classifies
+59.1% of the flows with an accuracy of 0.909 and defers the rest to the analyst; with telemetry for half of
+the flows (budget 128, five seeds) the accuracy on the classified flows is 0.954 at a coverage of 0.708. Accuracy over
+all flows does not reach 95%, because the official test partition limits full-feature tabular models to
+about 0.90, so accuracy should always be read together with coverage.
+
+## Citation
+
+```bibtex
+@unpublished{massaoudi2026conceptguardrl,
+  author = {Massaoudi, Mohamed and Ez Eddin, Maymouna},
+  title  = {{ConceptGuard-RL}: Intervenable Concept Bottlenecks for Explainable Intrusion Response},
+  year   = {2026},
+  note   = {Manuscript submitted to the Journal of Information Security and Applications}
+}
+```
 
 ## License
 
-MIT — see `LICENSE`.
+MIT License. See the `LICENSE` file.
+
+## Contact
+
+Mohamed Massaoudi, Department of Electrical and Computer Engineering, Texas A&M University,
+mohamed.massaoudi@tamu.edu
